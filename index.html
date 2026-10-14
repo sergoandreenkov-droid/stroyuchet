@@ -2029,7 +2029,10 @@ let realtimeChannel=null;
 function syncIsOn(){ return !!(DB.settings.syncEnabled && DB.settings.supabaseUrl && DB.settings.supabaseKey); }
 function storageBucketName(){ return DB.settings.syncBucket || 'stroyuchet'; }
 
+const SU_BUILD='v18-6';
+const syncLogMem=[];
 function syncLog(msg){
+  try{syncLogMem.unshift(new Date().toLocaleTimeString('ru-RU')+' '+String(msg).slice(0,200));if(syncLogMem.length>20)syncLogMem.length=20}catch(e){}
   try{if(window.__suSyncEvt)window.__suSyncEvt(msg)}catch(e){}
   const el=document.getElementById('syncLogBox');
   const t=new Date().toLocaleTimeString('ru-RU');
@@ -2285,6 +2288,7 @@ async function syncPullAll(showResult=true){
   updateAllWorkerNamesDatalist();
   refreshStaffDatalists();
   syncLog(`pull all: ok=${ok} skip=${skip} protected=${protectedCount} repaired=${repaired} fail=${fail}`);
+  syncHeartbeat();
   if(showResult) showToast(fail?`⚠️ Обновлено ${ok}, ошибок ${fail}`:`✅ Объединено ${ok} коллекций${repaired?`, восстановление ${repaired}`:''}`);
 }
 
@@ -2334,6 +2338,38 @@ function syncSubscribeRealtime(){
       .subscribe((status)=>{ syncLog('realtime: '+status); });
   }catch(e){ console.error('[sync] realtime subscribe', e); }
 }
+/* Служебная запись о состоянии устройства (object_id='__diag'), другие устройства её игнорируют */
+let syncHeartbeatAt=0;
+async function syncHeartbeat(force){
+  if(!sb || !syncIsOn()) return;
+  if(!force && Date.now()-syncHeartbeatAt<60000) return;
+  syncHeartbeatAt=Date.now();
+  try{
+    const sizes={}; ['objects','events','timesheet','staff','docs','journals'].forEach(c=>sizes[c]=collectionSize(c));
+    const payload={build:SU_BUILD, at:new Date().toISOString(), page:location.origin+location.pathname,
+      standalone:!!((window.matchMedia&&matchMedia('(display-mode: standalone)').matches)||navigator.standalone),
+      obj:currentObjectId||'', sizes, realtime:!!realtimeChannel, user:getCurrentUserFullName(),
+      ua:navigator.userAgent.slice(0,160), log:syncLogMem.slice(0,15)};
+    const row={object_id:'__diag', collection:syncDeviceId, payload, updated_at:new Date().toISOString(), updated_by:getCurrentUserFullName(), device_id:syncDeviceId};
+    const {data:cur}=await sb.from('sync_data').select('version').eq('object_id','__diag').eq('collection',syncDeviceId).maybeSingle();
+    if(cur) await sb.from('sync_data').update(Object.assign(row,{version:(cur.version||0)+1})).eq('object_id','__diag').eq('collection',syncDeviceId);
+    else await sb.from('sync_data').insert(Object.assign(row,{version:1}));
+  }catch(e){ console.warn('[sync] heartbeat',e); }
+}
+/* При возврате в программу (iPhone «размораживает» страницу) — сразу получить данные и переподключить realtime */
+let syncResumeAt=0;
+function syncOnResume(){
+  if(document.hidden || !syncIsOn()) return;
+  if(Date.now()-syncResumeAt<5000) return;
+  syncResumeAt=Date.now();
+  if(!sb && !syncInitClient()) return;
+  syncLog('↻ программа открыта — получаю данные');
+  syncSubscribeRealtime();
+  syncPullAll(false);
+}
+document.addEventListener('visibilitychange',syncOnResume);
+window.addEventListener('pageshow',e=>{ if(e.persisted) syncOnResume(); });
+window.addEventListener('focus',syncOnResume);
 function syncUnsubscribeRealtime(){
   if(realtimeChannel && sb){ try{sb.removeChannel(realtimeChannel)}catch(e){} }
   realtimeChannel=null;

@@ -1,5 +1,5 @@
 /* СтройУчёт MAX — service worker. Меняйте VERSION при каждом выпуске. */
-const VERSION = 'su-v18-5';
+const VERSION = 'su-v18-6';
 const SHELL = `shell-${VERSION}`;
 const RUNTIME = 'runtime-libs';
 const PRECACHE = [
@@ -44,7 +44,7 @@ self.addEventListener('fetch', e => {
   // Страница: сначала сеть (чтобы получать обновления), без сети — из кэша
   if (req.mode === 'navigate') {
     e.respondWith(
-      fetch(req).then(r => { const copy = r.clone(); caches.open(SHELL).then(c => c.put('./index.html', copy)); return r; })
+      fetch(req.url, {cache: 'no-cache', credentials: 'same-origin'}).then(r => { const copy = r.clone(); caches.open(SHELL).then(c => c.put('./index.html', copy)); return r; })
         .catch(() => caches.match('./index.html').then(r => r || caches.match('./')))
     );
     return;
