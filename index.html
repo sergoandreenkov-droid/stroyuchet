@@ -2070,7 +2070,7 @@ async function syncPushCollection(collection){
         .eq('collection', collection)
         .maybeSingle();
       if(readError) throw readError;
-      const mergedPayload = mergeSyncPayload(localPayload, cur?.payload);
+      const mergedPayload = mergeSyncPayload(localPayload, cur?.payload, collection);
       const row = {
         object_id: objKey, collection, payload: mergedPayload,
         updated_at: new Date().toISOString(), updated_by: updatedBy,
@@ -2089,6 +2089,7 @@ async function syncPushCollection(collection){
         else if(error.code!=='23505' && !/duplicate key/i.test(error.message||'')) throw error;
       }
       if(wrote){
+        syncBaseSet(collection, mergedPayload);
         const nextLocal = scoped ? DB[collection].filter(x=>!belongs(x)).concat(mergedPayload) : mergedPayload;
         if(JSON.stringify(DB[collection]) !== JSON.stringify(nextLocal)){ DB[collection] = nextLocal; save(true); }
         return {ok:true,merged:JSON.stringify(localPayload)!==JSON.stringify(mergedPayload),attempts:attempt+1};
@@ -2153,7 +2154,28 @@ function canonicalizeSyncArray(arr){
   });
   return Array.from(map.values());
 }
-function mergeSyncPayload(localPayload, serverPayload){
+/* База для настроек: последнее состояние, согласованное с сервером (на этом устройстве). */
+const SYNC_OBJECT_DEFAULTS={settings:{fuelPrice:65,workerRate:450,supabaseUrl:'',supabaseKey:'',syncBucket:'stroyuchet',syncEnabled:false}};
+function syncBaseGet(c){try{const v=SUStorage.getItem('su_sync_base_'+c);return v?JSON.parse(v):null}catch(e){return null}}
+function syncBaseSet(c,payload){
+  if(!c||!payload||typeof payload!=='object'||Array.isArray(payload))return;
+  try{SUStorage.setItem('su_sync_base_'+c,JSON.stringify(payload))}catch(e){}
+}
+function mergeSyncObject(localObj, serverObj, collection){
+  const l=localObj||{}, sv=serverObj||{}, base=collection?syncBaseGet(collection):null;
+  const def=SYNC_OBJECT_DEFAULTS[collection]||{}, J=x=>JSON.stringify(x), out={};
+  new Set(Object.keys(sv).concat(Object.keys(l))).forEach(k=>{
+    const lv=l[k], svv=sv[k];
+    if(svv===undefined){ out[k]=lv; return; }
+    if(lv===undefined){ out[k]=svv; return; }
+    // Локальное значение побеждает, только если его меняли с последней синхронизации.
+    // Без базы (первая синхронизация) значения по умолчанию уступают серверу.
+    const changedLocally = base ? J(lv)!==J(base[k]) : (!(k in def) || J(lv)!==J(def[k]));
+    out[k] = changedLocally ? lv : svv;
+  });
+  return out;
+}
+function mergeSyncPayload(localPayload, serverPayload, collection){
   if(Array.isArray(localPayload) || Array.isArray(serverPayload)){
     const localArr=canonicalizeSyncArray(localPayload);
     const serverArr=canonicalizeSyncArray(serverPayload);
@@ -2166,9 +2188,9 @@ function mergeSyncPayload(localPayload, serverPayload){
     return Array.from(map.values());
   }
   if((localPayload && typeof localPayload==='object') || (serverPayload && typeof serverPayload==='object')){
-    // Settings/prices/config maps are merged key-by-key; local values win on conflicts
-    // because they may contain unsent changes made on this device.
-    return Object.assign({}, serverPayload||{}, localPayload||{});
+    // Settings/prices/config maps are merged key-by-key: a local value wins only
+    // if it was changed on this device since the last sync (see mergeSyncObject).
+    return mergeSyncObject(localPayload, serverPayload, collection);
   }
   return serverPayload!==undefined && serverPayload!==null ? serverPayload : localPayload;
 }
@@ -2224,7 +2246,8 @@ async function syncPullCollection(collection, force=false){
 
     // The full pull creates one backup before the collection loop. Do not create
     // another multi-megabyte backup for every collection.
-    const merged = mergeSyncPayload(DB[collection], payloadRows);
+    const merged = mergeSyncPayload(DB[collection], payloadRows, collection);
+    syncBaseSet(collection, payloadRows);
     const changed = JSON.stringify(DB[collection]) !== JSON.stringify(merged);
     const needsPush = JSON.stringify(merged) !== JSON.stringify(payloadRows);
     DB[collection] = merged;
@@ -2291,7 +2314,8 @@ function syncSubscribeRealtime(){
           if(row.object_id !== objKey && row.object_id !== 'global') return;
 
           try{
-            const merged = mergeSyncPayload(DB[row.collection], row.payload);
+            const merged = mergeSyncPayload(DB[row.collection], row.payload, row.collection);
+            syncBaseSet(row.collection, row.payload);
             const needsPush = JSON.stringify(merged) !== JSON.stringify(row.payload);
             const changed = JSON.stringify(DB[row.collection]) !== JSON.stringify(merged);
             DB[row.collection] = merged;
