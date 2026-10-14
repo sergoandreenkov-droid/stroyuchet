@@ -869,6 +869,13 @@ tr.day-sep td{background:var(--hover);font-weight:700;font-size:12px;color:var(-
         Фото и документы загружаются в Supabase Storage, в базе хранятся только URL.
         <b>Защита от затирания:</b> если на сервере пусто, а локально есть данные — pull пропускается.
       </div>
+      <div class="form-field" style="margin-top:12px">
+        <label>📲 Подключиться по ссылке (вставьте ссылку или код с компьютера)</label>
+        <div style="display:flex;gap:6px;flex-wrap:wrap">
+          <input id="syncConnectText" placeholder="https://…#sync=…" autocomplete="off" style="flex:1;min-width:0">
+          <button class="btn btn-primary btn-sm" onclick="syncConnectFromText()">Подключить</button>
+        </div>
+      </div>
       <div id="syncPhoneBox" hidden style="margin-top:12px;padding:12px;border:1px dashed var(--muted);border-radius:10px">
         <div class="form-field" style="margin:0 0 8px">
           <label>Адрес программы для телефона (из окна start.sh)</label>
@@ -2471,11 +2478,15 @@ function syncApplyFromHash(){
   const m=/[#&]sync=([^&]+)/.exec(location.hash||'');
   if(!m) return false;
   try{ history.replaceState(null,'',location.pathname+location.search); }catch(e){}
-  let cfg; try{ cfg=JSON.parse(syncB64Dec(m[1])); }catch(e){ showToast('❌ Ссылка подключения повреждена'); return false; }
-  if(!cfg || !cfg.u || !cfg.k) return false;
+  return syncApplyCode(m[1]);
+}
+function syncApplyCode(code){
+  let cfg; try{ cfg=JSON.parse(syncB64Dec(code)); }catch(e){ showToast('❌ Ссылка подключения повреждена'); return false; }
+  if(!cfg || !cfg.u || !cfg.k){ showToast('❌ В ссылке нет настроек синхронизации'); return false; }
   DB.settings.supabaseUrl=cfg.u; DB.settings.supabaseKey=cfg.k; DB.settings.syncBucket=cfg.b||'stroyuchet';
   DB.settings.syncEnabled=true;
-  if(cfg.o){ currentObjectId=String(cfg.o); SUStorage.setItem('su_current_object',currentObjectId); }
+  // Объект выбираем после загрузки списка объектов (иначе он сбрасывается как неизвестный)
+  window.__syncPendingObj=cfg.o?String(cfg.o):'';
   try{SUStorage.removeItem('su_recovery_hold_sync_v1')}catch(e){}
   save(true);
   const su=document.getElementById('syncUrl');if(su)su.value=cfg.u;
@@ -2483,6 +2494,21 @@ function syncApplyFromHash(){
   const sbk=document.getElementById('syncBucket');if(sbk)sbk.value=DB.settings.syncBucket;
   syncLog('📱 настройки получены по ссылке подключения');
   return true;
+}
+async function syncFinishPhoneConnect(){
+  let id=window.__syncPendingObj||''; window.__syncPendingObj='';
+  const act=(DB.objects||[]).filter(o=>o&&!o.deleted);
+  if(!id && !currentObjectId && act.length===1) id=String(act[0].id);
+  if(id && act.find(o=>String(o.id)===id)) setCurrentObject(id); // сам подтянет данные объекта
+  else { try{updateObjectDisplay();renderAll()}catch(e){} }
+}
+async function syncConnectFromText(){
+  const v=(document.getElementById('syncConnectText')||{}).value||'';
+  const m=/sync=([A-Za-z0-9_-]+)/.exec(v.trim()) || /^([A-Za-z0-9_-]{20,})$/.exec(v.trim());
+  if(!m){ showToast('❌ Вставьте ссылку подключения с компьютера'); return; }
+  if(!syncApplyCode(m[1])) return;
+  await syncEnable();
+  await syncFinishPhoneConnect();
 }
 
 let syncStartupPullDone=false;
@@ -5413,7 +5439,7 @@ Object.assign(window,{
   aiSave,aiInitUI,aiUpdateStatus,toggleAI,saveAISettings,testAIConnection,aiText,aiVision,aiCaptionWorkPhotos,aiCaptionDiaryPhotos,aiClassifyIssue,aiSmartFill,
   syncEnable,syncDisable,syncPushAll,syncPullAll,syncSaveConfig,syncPushCollection,syncPullCollection,
   syncSubscribeRealtime,syncUnsubscribeRealtime,syncStartAutoPull,syncStopAutoPull,updateSyncUI,syncIsOn,schedulePush,
-  syncInitClient,syncObjectKey,syncLog,syncAutoStart,syncShowPhoneLink,syncCopyPhoneLink,syncApplyFromHash,
+  syncInitClient,syncObjectKey,syncLog,syncAutoStart,syncShowPhoneLink,syncCopyPhoneLink,syncApplyFromHash,syncApplyCode,syncConnectFromText,syncFinishPhoneConnect,
   savePullBackup,restorePullBackup,restoreBeforePull,
   uploadFileToStorage,uploadBase64ToStorage,deleteFileFromStorage,storagePathFromUrl,uploadFilesArray,sanitizeFilename,
   renderAll,updateAllWorkerNamesDatalist,
@@ -5544,7 +5570,7 @@ document.addEventListener('DOMContentLoaded',()=>{
   refreshStaffDatalists();
   purgeOldTrash();
   aiInitUI();
-  if(syncApplyFromHash()){ updateObjectDisplay(); syncEnable(); } else syncAutoStart();
+  if(syncApplyFromHash()){ syncEnable().then(syncFinishPhoneConnect); } else syncAutoStart();
   setTimeout(()=>{loadWeather()},500);
   setTimeout(()=>{doAutoBackup()},3000);
   setInterval(()=>{doAutoBackup()},3600000);

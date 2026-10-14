@@ -1,5 +1,5 @@
 /* СтройУчёт MAX — service worker. Меняйте VERSION при каждом выпуске. */
-const VERSION = 'su-v18-1';
+const VERSION = 'su-v18-2';
 const SHELL = `shell-${VERSION}`;
 const RUNTIME = 'runtime-libs';
 const PRECACHE = [
