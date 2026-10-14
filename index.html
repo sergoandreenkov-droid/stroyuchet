@@ -5545,7 +5545,7 @@ Object.assign(window,{
     return {added,restored};
   }
   window.__suRecoveryV18=function(){
-    if(SUStorage.getItem(RECOVERY_KEY)==='1'){ if(typeof syncStartupPullDone!=='undefined')syncStartupPullDone=true; return {skipped:true}; }
+    if(SUStorage.getItem(RECOVERY_KEY)==='1'){ return {skipped:true}; }
     let changed=0;
     try{
       Object.keys(LS).forEach(name=>{
