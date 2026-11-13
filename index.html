@@ -2029,7 +2029,7 @@ let realtimeChannel=null;
 function syncIsOn(){ return !!(DB.settings.syncEnabled && DB.settings.supabaseUrl && DB.settings.supabaseKey); }
 function storageBucketName(){ return DB.settings.syncBucket || 'stroyuchet'; }
 
-const SU_BUILD='v18-8';
+const SU_BUILD='v18-9';
 const syncLogMem=[];
 function syncLog(msg){
   try{syncLogMem.unshift(new Date().toLocaleTimeString('ru-RU')+' '+String(msg).slice(0,200));if(syncLogMem.length>20)syncLogMem.length=20}catch(e){}
@@ -2833,6 +2833,19 @@ if(SUStorage.getItem(FIX_KEY)!=='1'){
   }catch(e){console.error('Ошибка исправления кодировки:',e);}
 }
 })();
+/* Фото, вшитые в записи как base64, раздувают пакет синхронизации (было 2,8 МБ
+   на 51 работу) и обновление упирается в таймаут Supabase. Раз в сессию,
+   если такие фото есть, переносим их в облачное хранилище и заменяем ссылками. */
+let photoAutoTried=false;
+function autoMigratePhotosOnce(){
+  if(photoAutoTried) return;
+  photoAutoTried=true;
+  try{
+    const hasInline=()=>['events','photoDiary','issues','hiddenActs'].some(c=>(DB[c]||[]).some(r=>Array.isArray(r&&r.photos)&&r.photos.some(u=>typeof u==='string'&&u.startsWith('data:image/'))));
+    if(!syncIsOn()||!hasInline()) return;
+    setTimeout(()=>{ try{ if(typeof migratePhotosToStorage==='function') migratePhotosToStorage(); }catch(e){ console.warn('auto photo migrate', e); } }, 3000);
+  }catch(e){}
+}
 function syncAutoStart(){
   if(SUStorage.getItem('su_recovery_hold_sync_v1')==='1'){
     updateSyncUI();
@@ -2848,7 +2861,7 @@ function syncAutoStart(){
       // and never replaces a newer local record with an older server record.
       if(!syncStartupPullDone){
         syncStartupPullDone=true;
-        setTimeout(()=>{ Promise.resolve(syncPullAll(false)).then(()=>syncFlushDirty()).catch(()=>{}); }, 1200);
+        setTimeout(()=>{ Promise.resolve(syncPullAll(false)).then(()=>{ syncFlushDirty(); autoMigratePhotosOnce(); }).catch(()=>{}); }, 1200);
       }
     }
   } else {
