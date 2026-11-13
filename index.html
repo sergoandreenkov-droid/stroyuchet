@@ -2029,7 +2029,7 @@ let realtimeChannel=null;
 function syncIsOn(){ return !!(DB.settings.syncEnabled && DB.settings.supabaseUrl && DB.settings.supabaseKey); }
 function storageBucketName(){ return DB.settings.syncBucket || 'stroyuchet'; }
 
-const SU_BUILD='v18-7';
+const SU_BUILD='v18-8';
 const syncLogMem=[];
 function syncLog(msg){
   try{syncLogMem.unshift(new Date().toLocaleTimeString('ru-RU')+' '+String(msg).slice(0,200));if(syncLogMem.length>20)syncLogMem.length=20}catch(e){}
@@ -2062,7 +2062,10 @@ async function syncPushCollection(collection){
   const objKey = syncObjectKey(collection);
   const scoped = !GLOBAL_COLLECTIONS.includes(collection) && !!currentObjectId && Array.isArray(DB[collection]);
   const curObj = String(currentObjectId||'');
-  const belongs = x => String((x&&x.objectId)||'')===curObj;
+  // Записи без objectId (старые, до разметки по объектам) отправляем вместе с текущим
+  // объектом: иначе они навсегда остаются только на устройстве и вызывают вечный
+  // «не отправлено» -> повторную отправку при каждом pull.
+  const belongs = x => { const o=String((x&&x.objectId)||''); return !o || o===curObj; };
   const updatedBy = getCurrentUserFullName();
   try{
     for(let attempt=0; attempt<5; attempt++){
