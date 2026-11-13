@@ -2029,7 +2029,7 @@ let realtimeChannel=null;
 function syncIsOn(){ return !!(DB.settings.syncEnabled && DB.settings.supabaseUrl && DB.settings.supabaseKey); }
 function storageBucketName(){ return DB.settings.syncBucket || 'stroyuchet'; }
 
-const SU_BUILD='v18-6';
+const SU_BUILD='v18-7';
 const syncLogMem=[];
 function syncLog(msg){
   try{syncLogMem.unshift(new Date().toLocaleTimeString('ru-RU')+' '+String(msg).slice(0,200));if(syncLogMem.length>20)syncLogMem.length=20}catch(e){}
@@ -2067,12 +2067,12 @@ async function syncPushCollection(collection){
   try{
     for(let attempt=0; attempt<5; attempt++){
       const localPayload = scoped ? DB[collection].filter(belongs) : DB[collection];
-      const { data: cur, error: readError } = await sb
+      const { data: cur, error: readError } = await syncWithTimeout(sb
         .from('sync_data')
         .select('payload, version, updated_at, updated_by, device_id')
         .eq('object_id', objKey)
         .eq('collection', collection)
-        .maybeSingle();
+        .maybeSingle());
       if(readError) throw readError;
       const mergedPayload = mergeSyncPayload(localPayload, cur?.payload, collection);
       const row = {
@@ -2084,11 +2084,11 @@ async function syncPushCollection(collection){
       if(cur){
         let q = sb.from('sync_data').update(row).eq('object_id', objKey).eq('collection', collection);
         q = (cur.version==null) ? q.is('version', null) : q.eq('version', cur.version);
-        const { data: upd, error } = await q.select('version');
+        const { data: upd, error } = await syncWithTimeout(q.select('version'));
         if(error) throw error;
         wrote = Array.isArray(upd) && upd.length>0;
       } else {
-        const { error } = await sb.from('sync_data').insert(row);
+        const { error } = await syncWithTimeout(sb.from('sync_data').insert(row));
         if(!error) wrote=true;
         else if(error.code!=='23505' && !/duplicate key/i.test(error.message||'')) throw error;
       }
@@ -2096,6 +2096,7 @@ async function syncPushCollection(collection){
         syncBaseSet(collection, mergedPayload);
         const nextLocal = scoped ? DB[collection].filter(x=>!belongs(x)).concat(mergedPayload) : mergedPayload;
         if(JSON.stringify(DB[collection]) !== JSON.stringify(nextLocal)){ DB[collection] = nextLocal; save(true); }
+        syncClearDirty(collection);
         return {ok:true,merged:JSON.stringify(localPayload)!==JSON.stringify(mergedPayload),attempts:attempt+1};
       }
       syncLog(`↻ ${collection}: конфликт версий, повтор ${attempt+1}`);
@@ -2105,27 +2106,41 @@ async function syncPushCollection(collection){
   }catch(e){
     console.error('[sync] push error', collection, e);
     syncLog(`✗ push ${collection}: ${e.message||e}`);
+    syncMarkDirty(collection);
     return {ok:false,error:e.message||String(e)};
   }
 }
 
-async function syncPushAll(showResult=true){
+async function syncPushAll(showResult=true, onlyList=null){
   if(!DB.settings.supabaseUrl || !DB.settings.supabaseKey){
     if(showResult) showToast('❌ Сначала укажите URL и ключ');
     return;
   }
   if(!syncInitClient()){ if(showResult) showToast('❌ Не удалось создать клиент Supabase'); return; }
-  if(syncPushing){ if(showResult) showToast('⏳ Уже идёт'); return; }
+  if(syncPushing){ syncPushQueued=true; if(showResult) showToast('⏳ Уже идёт'); return; }
   syncPushing=true;
   if(showResult) showToast('☁️ Отправка...');
   let ok=0, fail=0;
-  for(const c of SYNC_COLLECTIONS){
-    const r = await syncPushCollection(c);
-    if(r.ok) ok++; else fail++;
+  const list = (Array.isArray(onlyList) && onlyList.length)
+    ? onlyList.filter(c=>SYNC_COLLECTIONS.includes(c))
+    : SYNC_COLLECTIONS;
+  try{
+    for(const c of list){
+      const r = await syncPushCollection(c);
+      if(r.ok) ok++; else fail++;
+    }
+  } finally {
+    // Флаг снимается всегда — иначе один зависший запрос навсегда блокирует отправку.
+    syncPushing=false;
+    syncPushQueued=false;
+    syncLog(`push all: ok=${ok} fail=${fail}`);
+    if(showResult) showToast(fail?`⚠️ Отправлено ${ok}, ошибок ${fail}`:`✅ Отправлено ${ok} коллекций`);
+    if(syncDirtyList().length){
+      syncScheduleRetry();
+    } else {
+      syncRetryDelay=15000;
+    }
   }
-  syncPushing=false;
-  syncLog(`push all: ok=${ok} fail=${fail}`);
-  if(showResult) showToast(fail?`⚠️ Отправлено ${ok}, ошибок ${fail}`:`✅ Отправлено ${ok} коллекций`);
 }
 
 /* ---- СИНХРОНИЗАЦИЯ БЕЗ ЗАТИРАНИЯ ---- */
@@ -2230,14 +2245,18 @@ async function syncPullCollection(collection, force=false){
   if(!sb) return {ok:false,error:'no client'};
   const objKey = syncObjectKey(collection);
   try{
-    const { data, error } = await sb
+    const { data, error } = await syncWithTimeout(sb
       .from('sync_data')
       .select('payload, updated_at, updated_by, device_id, version')
       .eq('object_id', objKey)
       .eq('collection', collection)
-      .maybeSingle();
+      .maybeSingle());
     if(error) throw error;
-    if(!data) return {ok:true, skipped:true};
+    if(!data){
+      // Записи в облаке ещё нет: локальные данные должны уехать наверх.
+      if(collectionSize(collection) > 0) syncMarkDirty(collection);
+      return {ok:true, skipped:true};
+    }
 
     const payloadRows = data.payload;
     const serverLen = Array.isArray(payloadRows) ? payloadRows.length : (payloadRows && typeof payloadRows === 'object' ? Object.keys(payloadRows).length : 0);
@@ -2246,7 +2265,12 @@ async function syncPullCollection(collection, force=false){
     if(serverLen === 0 && localLen > 0 && !force){
       syncLog(`🛡 ${collection}: на сервере пусто, локально ${localLen} — объединение без потери локальных данных`);
     }
-    if(data.device_id === syncDeviceId && !force) return {ok:true, skipped:true};
+    if(data.device_id === syncDeviceId && !force){
+      // В облаке своя же запись — тянуть нечего. Но если на устройстве остались
+      // неотправленные изменения, отправляем их, а не молчим.
+      if(syncDirtyList().includes(collection)) schedulePush(collection);
+      return {ok:true, skipped:true};
+    }
 
     // The full pull creates one backup before the collection loop. Do not create
     // another multi-megabyte backup for every collection.
@@ -2257,7 +2281,12 @@ async function syncPullCollection(collection, force=false){
     DB[collection] = merged;
 
     syncLog(`↓ ${collection} ← ${objKey} (${data.updated_by||'—'}, локально ${localLen}, сервер ${serverLen}, после объединения ${collectionSize(collection)})`);
-    if(needsPush && !force) schedulePush(collection);
+    if(needsPush && !force){
+      syncMarkDirty(collection);
+      schedulePush(collection);
+    } else if(!needsPush){
+      syncClearDirty(collection);
+    }
     return {ok:true,changed,needsPush,updatedBy:data.updated_by,version:data.version};
   }catch(e){
     console.error('[sync] pull error', collection, e);
@@ -2370,6 +2399,10 @@ function syncOnResume(){
 document.addEventListener('visibilitychange',syncOnResume);
 window.addEventListener('pageshow',e=>{ if(e.persisted) syncOnResume(); });
 window.addEventListener('focus',syncOnResume);
+/* Уход со страницы/сворачивание и возврат сети — повод дослать неотправленное. */
+document.addEventListener('visibilitychange',()=>{ if(document.hidden){ try{syncFlushDirty();}catch(e){} } });
+window.addEventListener('pagehide',()=>{ try{syncFlushDirty();}catch(e){} });
+window.addEventListener('online',()=>{ try{syncFlushDirty();syncOnResume();}catch(e){} });
 function syncUnsubscribeRealtime(){
   if(realtimeChannel && sb){ try{sb.removeChannel(realtimeChannel)}catch(e){} }
   realtimeChannel=null;
@@ -2448,6 +2481,7 @@ function updateSyncUI(){
     <div class="diag-row"><span class="lbl">Пользователь</span><span class="val">${esc(getCurrentUserFullName())}</span></div>
     <div class="diag-row"><span class="lbl">Bucket</span><span class="val">${esc(storageBucketName())}</span></div>
     <div class="diag-row"><span class="lbl">Авто-пул</span><span class="val">каждые 30 сек</span></div>
+    <div class="diag-row"><span class="lbl">Не отправлено</span><span class="val">${syncDirtyList().length?('⚠️ '+syncDirtyList().length+' колл.'):'—'}</span></div>
     <div class="diag-row"><span class="lbl">Realtime</span><span class="val">${realtimeChannel?'✅':'❌'}</span></div>
     <div class="diag-row"><span class="lbl">Защита</span><span class="val">🛡️ включена</span></div>
     <div class="diag-row"><span class="lbl">Бэкапов pull</span><span class="val">${(JSON.parse(SUStorage.getItem(PULL_BACKUP_KEY)||'[]')).length}/${MAX_PULL_BACKUPS}</span></div>
@@ -2472,18 +2506,70 @@ function syncSaveConfig(){
 }
 
 let syncPushDebounce=null;
+let syncPushQueued=false;
+let syncRetryTimer=null;
+let syncRetryDelay=15000;
+const SYNC_DIRTY_KEY='su_dirty_collections';
+
+/* Коллекции, изменения которых ещё не подтверждены сервером.
+   Хранятся в localStorage, поэтому не теряются при закрытии приложения. */
+function syncDirtyList(){
+  try{
+    const v=JSON.parse(SUStorage.getItem(SYNC_DIRTY_KEY)||'[]');
+    return Array.isArray(v)?v.filter(c=>SYNC_COLLECTIONS.includes(c)):[];
+  }catch(e){ return [] }
+}
+function syncDirtySet(list){
+  try{
+    const now=Array.from(new Set((list||[]).filter(c=>SYNC_COLLECTIONS.includes(c))));
+    if(now.length) SUStorage.setItem(SYNC_DIRTY_KEY,JSON.stringify(now));
+    else SUStorage.removeItem(SYNC_DIRTY_KEY);
+  }catch(e){}
+}
+function syncMarkDirty(collection){
+  if(collection==='*'){ syncDirtySet(SYNC_COLLECTIONS); return; }
+  if(!SYNC_COLLECTIONS.includes(collection)) return;
+  const cur=syncDirtyList(); cur.push(collection); syncDirtySet(cur);
+}
+function syncClearDirty(collection){ syncDirtySet(syncDirtyList().filter(c=>c!==collection)); }
+
+/* Любой запрос к Supabase ограничен по времени: зависший (например, при обрыве
+   сети на iPhone) не должен блокировать очередь отправки навсегда. */
+function syncWithTimeout(promise, ms){
+  const limit = (typeof ms==='number'&&ms>0)?ms:20000;
+  return Promise.race([
+    Promise.resolve(promise),
+    new Promise((_,rej)=>setTimeout(()=>rej(new Error('таймаут сети')), limit))
+  ]);
+}
+function syncScheduleRetry(){
+  if(syncRetryTimer) return;
+  const delay=syncRetryDelay;
+  syncRetryTimer=setTimeout(()=>{
+    syncRetryTimer=null;
+    syncRetryDelay=Math.min(Math.round(syncRetryDelay*2),300000);
+    if(syncDirtyList().length) syncFlushDirty();
+  }, delay);
+}
+async function syncFlushDirty(){
+  if(!syncIsOn()) return;
+  if(!sb && !syncInitClient()) return;
+  if(syncPushing){ syncPushQueued=true; return; }
+  const list=syncDirtyList();
+  if(!list.length) return;
+  await syncPushAll(false, list);
+}
 function schedulePush(collection){
-  if(!syncIsOn() || !sb) return;
+  if(!syncIsOn()) return;
+  if(Array.isArray(collection)) collection.forEach(c=>syncMarkDirty(c));
+  else syncMarkDirty(collection);
+  // Короткая задержка: при закрытии приложения сразу после сохранения данные
+  // уже помечены как неотправленные и уйдут при следующем запуске.
   if(syncPushDebounce) clearTimeout(syncPushDebounce);
   syncPushDebounce = setTimeout(()=>{
-    if(Array.isArray(collection)){
-      collection.forEach(c=>syncPushCollection(c));
-    } else if(collection==='*'){
-      syncPushAll(false);
-    } else {
-      syncPushCollection(collection);
-    }
-  }, 1500);
+    syncPushDebounce=null;
+    syncFlushDirty();
+  }, 400);
 }
 
 /* ---- Подключение телефона: ссылка/QR с настройками синхронизации ---- */
@@ -2759,7 +2845,7 @@ function syncAutoStart(){
       // and never replaces a newer local record with an older server record.
       if(!syncStartupPullDone){
         syncStartupPullDone=true;
-        setTimeout(()=>syncPullAll(false), 1200);
+        setTimeout(()=>{ Promise.resolve(syncPullAll(false)).then(()=>syncFlushDirty()).catch(()=>{}); }, 1200);
       }
     }
   } else {
